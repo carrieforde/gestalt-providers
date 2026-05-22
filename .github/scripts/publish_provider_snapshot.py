@@ -11,6 +11,11 @@ import sys
 import tarfile
 import tempfile
 
+try:
+    import yaml
+except ImportError as exc:
+    raise SystemExit("PyYAML is required; install it with .github/scripts/provider_registry_requirements.txt") from exc
+
 
 FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 METADATA_FIELDS = ("schema", "schemaVersion", "package", "kind", "version", "runtime")
@@ -33,7 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provider-ref", required=True, help="Full gestalt-providers commit SHA")
     parser.add_argument("--gestalt-ref", required=True, help="Full Gestalt commit SHA used to package")
     parser.add_argument("--repository", required=True, help="GitHub repository in owner/name form")
-    parser.add_argument("--dist-dir", required=True, help="Directory containing .tar.gz archives and provider-release.yaml")
+    parser.add_argument(
+        "--dist-dir",
+        required=True,
+        help="Directory containing .tar.gz archives, checksums.txt, and provider-release.yaml",
+    )
     parser.add_argument("--gcs-root", required=True, help="GCS root, for example gs://bucket/prefix")
     parser.add_argument("--dry-run", action="store_true", help="Validate and print uploads without writing to GCS")
     return parser.parse_args()
@@ -66,11 +75,17 @@ def validate_ref(name: str, value: str) -> str:
     return value.lower()
 
 
-def normalize_scalar(value: str) -> str:
-    trimmed = value.strip()
-    if len(trimmed) >= 2 and trimmed[0] == trimmed[-1] and trimmed[0] in {"'", '"'}:
-        return trimmed[1:-1]
-    return trimmed
+def load_provider_release_metadata(path: pathlib.Path) -> dict[str, object]:
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path} must contain a YAML mapping")
+    missing = [field for field in METADATA_FIELDS if data.get(field) in (None, "")]
+    if missing:
+        raise SystemExit(f"{path} is missing {', '.join(missing)}")
+    artifacts = data.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise SystemExit(f"{path} is missing artifacts")
+    return data
 
 
 def metadata_version(path: pathlib.Path) -> str:
@@ -81,48 +96,24 @@ def metadata_version(path: pathlib.Path) -> str:
 
 
 def metadata_fields(path: pathlib.Path) -> dict[str, str]:
-    fields: dict[str, str] = {}
-    with path.open("r", encoding="utf-8") as handle:
-        for raw in handle:
-            line = raw.rstrip("\n")
-            if line == "artifacts:":
-                break
-            if not line or line.startswith(" ") or ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            if key in METADATA_FIELDS:
-                fields[key] = normalize_scalar(value)
-    return fields
+    metadata = load_provider_release_metadata(path)
+    return {field: str(metadata[field]) for field in METADATA_FIELDS}
 
 
 def metadata_artifacts(path: pathlib.Path) -> dict[str, dict[str, str]]:
+    metadata = load_provider_release_metadata(path)
     artifacts: dict[str, dict[str, str]] = {}
-    current_target = ""
-    in_artifacts = False
-    with path.open("r", encoding="utf-8") as handle:
-        for raw in handle:
-            line = raw.rstrip("\n")
-            if not in_artifacts:
-                if line == "artifacts:":
-                    in_artifacts = True
-                continue
-            if line and not line.startswith(" "):
-                break
-            if line.startswith("  ") and line.endswith(":") and not line.startswith("    "):
-                current_target = normalize_scalar(line.strip()[:-1])
-                if current_target in artifacts:
-                    raise SystemExit(f"{path} has duplicate artifact target {current_target!r}")
-                artifacts[current_target] = {}
-            elif current_target and line.startswith("    path:"):
-                artifacts[current_target]["path"] = normalize_scalar(line.split(":", 1)[1])
-            elif current_target and line.startswith("    sha256:"):
-                artifacts[current_target]["sha256"] = normalize_scalar(line.split(":", 1)[1]).lower()
-    if not artifacts:
-        raise SystemExit(f"{path} is missing artifacts")
-    for target, artifact in artifacts.items():
+    for target, artifact_data in metadata["artifacts"].items():
+        if not isinstance(target, str) or not isinstance(artifact_data, dict):
+            raise SystemExit(f"{path} has invalid artifact target {target!r}")
+        artifact = {
+            "path": str(artifact_data.get("path") or ""),
+            "sha256": str(artifact_data.get("sha256") or "").lower(),
+        }
         missing = [name for name in ("path", "sha256") if not artifact.get(name)]
         if missing:
             raise SystemExit(f"{path} artifact {target!r} is missing {', '.join(missing)}")
+        artifacts[target] = artifact
     return artifacts
 
 
@@ -174,6 +165,14 @@ def merge_metadata(existing: pathlib.Path, local: pathlib.Path) -> str:
     return render_metadata(local_fields, merged)
 
 
+def render_checksums(metadata: pathlib.Path) -> str:
+    artifacts = metadata_artifacts(metadata)
+    return "".join(
+        f"{artifacts[target]['sha256']}  {artifacts[target]['path']}\n"
+        for target in sorted_targets(set(artifacts))
+    )
+
+
 def archive_manifest_versions(path: pathlib.Path) -> list[str]:
     versions: list[str] = []
     with tarfile.open(path, "r:gz") as archive:
@@ -194,9 +193,12 @@ def archive_manifest_versions(path: pathlib.Path) -> list[str]:
     return versions
 
 
-def validate_metadata_artifacts(metadata: pathlib.Path, archives: list[pathlib.Path]) -> None:
-    archive_digests = {archive.name: sha256_file(archive) for archive in archives}
+def validate_metadata_artifacts(
+    metadata: pathlib.Path,
+    archive_digests: dict[str, str],
+) -> dict[str, str]:
     referenced: set[str] = set()
+    metadata_digests: dict[str, str] = {}
     for target, artifact in metadata_artifacts(metadata).items():
         artifact_path = pathlib.PurePosixPath(artifact["path"].replace(os.sep, "/"))
         if artifact_path.is_absolute() or ".." in artifact_path.parts or len(artifact_path.parts) != 1:
@@ -212,15 +214,75 @@ def validate_metadata_artifacts(metadata: pathlib.Path, archives: list[pathlib.P
                 f"{metadata} artifact {target!r} checksum {artifact['sha256']} does not match {actual_digest}"
             )
         referenced.add(filename)
+        metadata_digests[filename] = artifact["sha256"]
     extras = sorted(set(archive_digests) - referenced)
     if extras:
         raise SystemExit(f"{metadata} does not reference archives: {', '.join(extras)}")
+    return metadata_digests
 
 
-def validate_dist(dist_dir: pathlib.Path, want_version: str) -> tuple[pathlib.Path, list[pathlib.Path]]:
+def validate_checksums(
+    checksums: pathlib.Path,
+    archive_digests: dict[str, str],
+    metadata_digests: dict[str, str],
+) -> None:
+    actual: dict[str, str] = {}
+    for line_number, raw in enumerate(checksums.read_text(encoding="utf-8").splitlines(), start=1):
+        if not raw.strip():
+            continue
+        parts = raw.split(None, 1)
+        if len(parts) != 2:
+            raise SystemExit(f"{checksums}:{line_number}: expected '<sha256> <filename>'")
+        digest, filename = parts[0].lower(), parts[1].strip()
+        if filename.startswith("*"):
+            filename = filename[1:]
+        artifact_path = pathlib.PurePosixPath(filename.replace(os.sep, "/"))
+        if (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or artifact_path.is_absolute()
+            or ".." in artifact_path.parts
+            or len(artifact_path.parts) != 1
+        ):
+            raise SystemExit(f"{checksums}:{line_number}: invalid checksum entry")
+        if filename in actual:
+            raise SystemExit(f"{checksums}:{line_number}: duplicate checksum for {filename}")
+        actual[filename] = digest
+    missing = sorted(set(archive_digests) - set(actual))
+    extra = sorted(set(actual) - set(archive_digests))
+    if missing:
+        raise SystemExit(f"{checksums} is missing archives: {', '.join(missing)}")
+    if extra:
+        raise SystemExit(f"{checksums} references unknown archives: {', '.join(extra)}")
+    mismatched = [
+        filename
+        for filename, digest in archive_digests.items()
+        if actual[filename] != digest
+    ]
+    if mismatched:
+        raise SystemExit(f"{checksums} has mismatched checksums: {', '.join(sorted(mismatched))}")
+    metadata_mismatched = [
+        filename
+        for filename, digest in metadata_digests.items()
+        if actual.get(filename) != digest
+    ]
+    if metadata_mismatched:
+        raise SystemExit(
+            f"{checksums} does not match provider-release.yaml for: "
+            f"{', '.join(sorted(metadata_mismatched))}"
+        )
+
+
+def validate_dist(
+    dist_dir: pathlib.Path,
+    want_version: str,
+) -> tuple[pathlib.Path, pathlib.Path, list[pathlib.Path]]:
     metadata = dist_dir / "provider-release.yaml"
     if not metadata.is_file():
         raise SystemExit(f"{metadata} not found")
+    checksums = dist_dir / "checksums.txt"
+    if not checksums.is_file():
+        raise SystemExit(f"{checksums} not found")
     got_metadata_version = metadata_version(metadata)
     if got_metadata_version != want_version:
         raise SystemExit(
@@ -233,8 +295,10 @@ def validate_dist(dist_dir: pathlib.Path, want_version: str) -> tuple[pathlib.Pa
         for got in archive_manifest_versions(archive):
             if got != want_version:
                 raise SystemExit(f"{archive} manifest version {got!r} does not match {want_version!r}")
-    validate_metadata_artifacts(metadata, archives)
-    return metadata, archives
+    archive_digests = {archive.name: sha256_file(archive) for archive in archives}
+    metadata_digests = validate_metadata_artifacts(metadata, archive_digests)
+    validate_checksums(checksums, archive_digests, metadata_digests)
+    return metadata, checksums, archives
 
 
 def gcs_destination(root: str, repository: str, provider_ref: str, provider_dir: str, filename: str) -> str:
@@ -342,7 +406,7 @@ def main() -> int:
     provider_dir = normalize_provider_dir(args.provider_dir)
     want_version = snapshot_version(provider_ref)
     dist_dir = pathlib.Path(args.dist_dir)
-    metadata, archives = validate_dist(dist_dir, want_version)
+    metadata, checksums, archives = validate_dist(dist_dir, want_version)
 
     # Upload archives first; metadata is the discoverable object and must appear last.
     for archive in archives:
@@ -354,15 +418,20 @@ def main() -> int:
             args.dry_run,
         )
 
+    checksums_dest = gcs_destination(
+        args.gcs_root, args.repository, provider_ref, provider_dir, "checksums.txt"
+    )
     metadata_dest = gcs_destination(
         args.gcs_root, args.repository, provider_ref, provider_dir, "provider-release.yaml"
     )
     if args.dry_run:
+        upload_metadata(checksums, checksums_dest, provider_ref, gestalt_ref, args.dry_run)
         upload_metadata(metadata, metadata_dest, provider_ref, gestalt_ref, args.dry_run)
         return 0
 
     existing_info = object_info(metadata_dest)
     if existing_info is None:
+        upload_metadata(checksums, checksums_dest, provider_ref, gestalt_ref, args.dry_run)
         upload_metadata(
             metadata, metadata_dest, provider_ref, gestalt_ref, args.dry_run, existing_info
         )
@@ -371,8 +440,18 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         existing_metadata = pathlib.Path(tmp) / "existing-provider-release.yaml"
         merged_metadata = pathlib.Path(tmp) / "provider-release.yaml"
+        merged_checksums = pathlib.Path(tmp) / "checksums.txt"
         existing_metadata.write_bytes(object_bytes(metadata_dest))
         merged_metadata.write_text(merge_metadata(existing_metadata, metadata), encoding="utf-8")
+        merged_checksums.write_text(render_checksums(merged_metadata), encoding="utf-8")
+        upload_metadata(
+            merged_checksums,
+            checksums_dest,
+            provider_ref,
+            gestalt_ref,
+            args.dry_run,
+            object_info(checksums_dest),
+        )
         upload_metadata(
             merged_metadata,
             metadata_dest,

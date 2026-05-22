@@ -64,7 +64,7 @@ jobs:
 
           case "$PLUGIN_ROOT" in
             agent|runtime|plugins|auth|authorization|externalcredentials|s3|indexeddb|workflow|cache|secrets|ui)
-              GESTALT_REF="main"
+              GESTALT_REF="$(cat .github/gestalt-ref)"
               ;;
             *)
               echo "ERROR: unsupported plugin root ${PLUGIN_ROOT}"

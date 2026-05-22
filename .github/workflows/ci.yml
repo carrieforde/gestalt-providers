@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/scripts/**'
+      - '.github/gestalt-ref'
       - 'registry/**'
       - 'agent/**'
       - 'runtime/**'
@@ -26,6 +27,7 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/scripts/**'
+      - '.github/gestalt-ref'
       - 'registry/**'
       - 'agent/**'
       - 'runtime/**'
@@ -47,7 +49,7 @@ permissions:
 
 env:
   GESTALT_REPOSITORY: valon-technologies/gestalt
-  GESTALT_REF: main
+  GESTALT_REF_FILE: .github/gestalt-ref
   VALIDATION_VERSION: 0.0.1-alpha.1
 
 jobs:
@@ -68,6 +70,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$GOBIN"
           echo "$GOBIN" >> "$GITHUB_PATH"
+          GESTALT_REF="$(cat "$GESTALT_REF_FILE")"
           toolchain_dir="${GITHUB_WORKSPACE}/../gestalt"
           .github/scripts/checkout_gestalt_ref.sh "$toolchain_dir" "$GESTALT_REF"
           (cd "$toolchain_dir/gestaltd" && go build -o "$GOBIN/gestaltd" ./cmd/gestaltd)
@@ -227,6 +230,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$GOBIN"
           echo "$GOBIN" >> "$GITHUB_PATH"
+          GESTALT_REF="$(cat "$GESTALT_REF_FILE")"
           toolchain_dir="${GITHUB_WORKSPACE}/../gestalt"
           .github/scripts/checkout_gestalt_ref.sh "$toolchain_dir" "$GESTALT_REF"
           (cd "$toolchain_dir/gestaltd" && go build -o "$GOBIN/gestaltd" ./cmd/gestaltd)
@@ -274,6 +278,7 @@ jobs:
         if: matrix.plugin.has_go || matrix.plugin.has_python || matrix.plugin.has_typescript
         run: |
           set -euo pipefail
+          GESTALT_REF="$(cat "$GESTALT_REF_FILE")"
           toolchain_dir="${GITHUB_WORKSPACE}/../gestalt"
           .github/scripts/checkout_gestalt_ref.sh "$toolchain_dir" "$GESTALT_REF"
           echo "GESTALT_CHECKOUT=$toolchain_dir" >> "$GITHUB_ENV"
@@ -286,6 +291,8 @@ jobs:
         run: |
           chmod +x "${RUNNER_TEMP}/bin/gestaltd"
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+      - name: Install script dependencies
+        run: python3 -m pip install -r .github/scripts/provider_registry_requirements.txt
       - name: Validate plugin
         env:
           OUTPUT_ROOT: ${{ runner.temp }}/dist
@@ -330,27 +337,36 @@ jobs:
 
           rm -rf "${OUTPUT_ROOT:?}/${plugin_name}"
           mkdir -p "${OUTPUT_ROOT}/${plugin_name}"
-          (cd "$plugin_dir" && gestaltd provider release --version "${VALIDATION_VERSION}" --output "${OUTPUT_ROOT}/${plugin_name}")
+          (cd "$plugin_dir" && gestaltd provider package --version "${VALIDATION_VERSION}" --output "${OUTPUT_ROOT}/${plugin_name}")
+          gestaltd provider release --dist-dir "${OUTPUT_ROOT}/${plugin_name}" --version "${VALIDATION_VERSION}"
 
           if [ ! -f "${OUTPUT_ROOT}/${plugin_name}/provider-release.yaml" ]; then
             echo "ERROR: ${plugin_name} did not produce provider-release.yaml"
             exit 1
           fi
-
-          python3 .github/scripts/write_provider_release_metadata.py \
-            --manifest "${plugin_dir}/manifest.yaml" \
-            --output-dir "${OUTPUT_ROOT}/${plugin_name}" \
-            --version "${VALIDATION_VERSION}" \
-            --metadata-path "${OUTPUT_ROOT}/${plugin_name}/provider-release.generated.yaml"
+          if [ ! -f "${OUTPUT_ROOT}/${plugin_name}/checksums.txt" ]; then
+            echo "ERROR: ${plugin_name} did not produce checksums.txt"
+            exit 1
+          fi
 
           if ! find "${OUTPUT_ROOT}/${plugin_name}" -mindepth 1 -maxdepth 1 -type f | grep -q .; then
             echo "ERROR: ${plugin_name} produced no packaged artifacts"
             exit 1
           fi
-          if [ ! -f "${OUTPUT_ROOT}/${plugin_name}/provider-release.generated.yaml" ]; then
-            echo "ERROR: ${plugin_name} did not regenerate provider-release metadata"
-            exit 1
-          fi
+
+          DIST_DIR="${OUTPUT_ROOT}/${plugin_name}" python3 - <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          sys.path.insert(0, ".github/scripts")
+          import publish_provider_snapshot
+
+          publish_provider_snapshot.validate_dist(
+              pathlib.Path(os.environ["DIST_DIR"]),
+              os.environ["VALIDATION_VERSION"],
+          )
+          PY
 
   ui-lint:
     name: UI Lint & Type Check
@@ -412,6 +428,7 @@ jobs:
       - name: Build gestaltd and UI
         run: |
           set -euo pipefail
+          GESTALT_REF="$(cat "$GESTALT_REF_FILE")"
           gestalt_dir="${GITHUB_WORKSPACE}/../gestalt"
           .github/scripts/checkout_gestalt_ref.sh "$gestalt_dir" "$GESTALT_REF"
 
@@ -427,9 +444,12 @@ jobs:
 
           # Package local providers as release metadata to avoid local-source fingerprint churn
           mkdir -p "${RUNNER_TEMP}/ui-default-release" "${RUNNER_TEMP}/indexeddb-relationaldb-release" "${RUNNER_TEMP}/external-credentials-default-release"
-          (cd ui/default && "${GITHUB_WORKSPACE}/../bin/gestaltd" provider release --version "${VALIDATION_VERSION}" --output "${RUNNER_TEMP}/ui-default-release")
-          (cd indexeddb/relationaldb && "${GITHUB_WORKSPACE}/../bin/gestaltd" provider release --version "${VALIDATION_VERSION}" --output "${RUNNER_TEMP}/indexeddb-relationaldb-release")
-          (cd externalcredentials/default && "${GITHUB_WORKSPACE}/../bin/gestaltd" provider release --version "${VALIDATION_VERSION}" --output "${RUNNER_TEMP}/external-credentials-default-release")
+          (cd ui/default && "${GITHUB_WORKSPACE}/../bin/gestaltd" provider package --version "${VALIDATION_VERSION}" --output "${RUNNER_TEMP}/ui-default-release")
+          "${GITHUB_WORKSPACE}/../bin/gestaltd" provider release --dist-dir "${RUNNER_TEMP}/ui-default-release" --version "${VALIDATION_VERSION}"
+          (cd indexeddb/relationaldb && "${GITHUB_WORKSPACE}/../bin/gestaltd" provider package --version "${VALIDATION_VERSION}" --output "${RUNNER_TEMP}/indexeddb-relationaldb-release")
+          "${GITHUB_WORKSPACE}/../bin/gestaltd" provider release --dist-dir "${RUNNER_TEMP}/indexeddb-relationaldb-release" --version "${VALIDATION_VERSION}"
+          (cd externalcredentials/default && "${GITHUB_WORKSPACE}/../bin/gestaltd" provider package --version "${VALIDATION_VERSION}" --output "${RUNNER_TEMP}/external-credentials-default-release")
+          "${GITHUB_WORKSPACE}/../bin/gestaltd" provider release --dist-dir "${RUNNER_TEMP}/external-credentials-default-release" --version "${VALIDATION_VERSION}"
 
           cat >"${RUNNER_TEMP}/gestaltd-web-e2e.yaml" <<EOF
           apiVersion: gestaltd.config/v5

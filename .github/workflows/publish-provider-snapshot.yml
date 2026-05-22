@@ -162,7 +162,7 @@ jobs:
             python_image="python:${{ matrix.provider.python_version }}-alpine${{ env.PYTHON_ALPINE_VERSION }}"
             .github/scripts/package_python_docker.sh linux/amd64 "${python_image}" gestaltd GESTALT_PYTHON_LINUX_AMD64 linux/amd64 "$PROVIDER_DIR" "$SNAPSHOT_VERSION"
           else
-            (cd "$PROVIDER_DIR" && gestaltd provider release --version "$SNAPSHOT_VERSION" --platform linux/amd64)
+            (cd "$PROVIDER_DIR" && gestaltd provider package --version "$SNAPSHOT_VERSION" --platform linux/amd64)
           fi
       - uses: actions/upload-artifact@v4
         with:
@@ -230,9 +230,9 @@ jobs:
             cp -R "${GESTALT_SDK_HOST_DIR}" /tmp/gestalt-sdk
             uv pip install --python "$PWD/.venv/bin/python" --reinstall --no-deps /tmp/gestalt-sdk
             GESTALT_PYTHON_DARWIN_ARM64="$PWD/.venv/bin/python" \
-              gestaltd provider release --version "$SNAPSHOT_VERSION" --platform darwin/arm64
+              gestaltd provider package --version "$SNAPSHOT_VERSION" --platform darwin/arm64
           else
-            (cd "$PROVIDER_DIR" && gestaltd provider release --version "$SNAPSHOT_VERSION" --platform darwin/arm64)
+            (cd "$PROVIDER_DIR" && gestaltd provider package --version "$SNAPSHOT_VERSION" --platform darwin/arm64)
           fi
       - uses: actions/upload-artifact@v4
         with:
@@ -260,20 +260,35 @@ jobs:
       - name: Verify provider ref
         run: |
           test "$(git rev-parse HEAD)" = "${{ inputs.provider-ref }}"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: Install gestaltd
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: |
+          set -euo pipefail
+          mkdir -p "$GOBIN"
+          echo "$GOBIN" >> "$GITHUB_PATH"
+          toolchain_dir="${GITHUB_WORKSPACE}/../gestalt"
+          .github/scripts/checkout_gestalt_ref.sh "$toolchain_dir" "${{ inputs.gestalt-ref }}"
+          test "$(git -C "$toolchain_dir" rev-parse HEAD)" = "${{ inputs.gestalt-ref }}"
+          (cd "$toolchain_dir/gestaltd" && CGO_ENABLED=0 go build -o "$GOBIN/gestaltd" ./cmd/gestaltd)
       - uses: actions/download-artifact@v4
         with:
           pattern: snapshot-dist-${{ matrix.provider.key }}-*
           path: ${{ matrix.provider.dir }}/dist
           merge-multiple: true
-      - name: Generate provider release metadata
+      - name: Install script dependencies
+        run: python3 -m pip install -r .github/scripts/provider_registry_requirements.txt
+      - name: Finalize provider release metadata
         env:
           PROVIDER_DIR: ${{ matrix.provider.dir }}
           SNAPSHOT_VERSION: 0.0.0-snapshot.g${{ inputs.provider-ref }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/write_provider_release_metadata.py \
-            --manifest "${PROVIDER_DIR}/manifest.yaml" \
-            --output-dir "${PROVIDER_DIR}/dist" \
+          gestaltd provider release \
+            --dist-dir "${PROVIDER_DIR}/dist" \
             --version "$SNAPSHOT_VERSION"
       - uses: google-github-actions/auth@v2
         if: ${{ !inputs.dry-run }}
