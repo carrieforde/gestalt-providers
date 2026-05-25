@@ -882,14 +882,14 @@ gestalt plugins invoke <plugin> <operation> --input-file payload.json --select d
         <p className="doc-copy">
           The CLI calls the same HTTP API that the workspace exposes for direct
           programmatic access. The API keeps{" "}
-          <code className="font-mono text-sm text-primary">integrations</code>{" "}
+          <code className="font-mono text-sm text-primary">apps</code>{" "}
           in its route paths even though the CLI uses{" "}
           <code className="font-mono text-sm text-primary">plugins</code>.
         </p>
         <CodeBlock
           code={`curl \\
   -H "Authorization: Bearer $GESTALT_API_KEY" \\
-  ${origin}/api/v1/integrations
+  ${origin}/api/v1/apps
 
 curl \\
   -H "Authorization: Bearer $GESTALT_API_KEY" \\

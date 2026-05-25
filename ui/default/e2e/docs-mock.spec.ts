@@ -167,7 +167,7 @@ test.describe("Docs page", () => {
     await expect(page.getByRole("tab", { name: "HTTP" })).toBeVisible();
     await page.getByRole("tab", { name: "HTTP" }).click();
     await expect(
-      page.getByText("/api/v1/integrations").first(),
+      page.getByText("/api/v1/apps").first(),
     ).toBeVisible();
 
     await leftNav.getByRole("link", { name: "Grant Authorization" }).click();

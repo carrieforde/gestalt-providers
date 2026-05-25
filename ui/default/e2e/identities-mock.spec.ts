@@ -33,7 +33,7 @@ async function wireIdentityRoutes(
     wrapGrantResponse?: boolean;
   },
 ) {
-  await page.route("**/api/v1/integrations", async (route, request) => {
+  await page.route("**/api/v1/apps", async (route, request) => {
     if (request.method() === "GET") {
       await route.fulfill({ json: state.visibleIntegrations });
       return;
@@ -205,7 +205,7 @@ async function wireIdentityRoutes(
       }
     }
 
-    if (parts[5] === "integrations") {
+    if (parts[5] === "apps") {
       if (parts.length === 6 && request.method() === "GET") {
         await route.fulfill({ json: state.managedIntegrationsByIdentityID[identityID] || [] });
         return;

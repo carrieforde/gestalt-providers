@@ -631,7 +631,7 @@ test.describe("Integrations", () => {
     await expect(page.getByRole("button", { name: "OAuth Service settings" })).toBeVisible();
 
     // Re-mock so GET returns disconnected state after DELETE fires
-    await page.route("**/api/v1/integrations", (route, request) => {
+    await page.route("**/api/v1/apps", (route, request) => {
       if (request.method() === "GET") {
         route.fulfill({ json: disconnected ? disconnectedList : connectedList });
       } else {
@@ -681,7 +681,7 @@ test.describe("Integrations", () => {
     await dialog.getByRole("button", { name: "Connect" }).click();
     await dialog.getByLabel(/API token/i).fill("test-api-key-123");
 
-    await page.route("**/api/v1/integrations", (route, request) => {
+    await page.route("**/api/v1/apps", (route, request) => {
       if (request.method() === "GET") {
         route.fulfill({ json: connected ? connectedList : disconnectedList });
       } else {
